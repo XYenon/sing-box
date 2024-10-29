@@ -17,6 +17,7 @@ type _Outbound struct {
 	VMessOptions        VMessOutboundOptions        `json:"-"`
 	TrojanOptions       TrojanOutboundOptions       `json:"-"`
 	WireGuardOptions    WireGuardOutboundOptions    `json:"-"`
+	TailscaleOptions    TailscaleOutboundOptions    `json:"-"`
 	HysteriaOptions     HysteriaOutboundOptions     `json:"-"`
 	TorOptions          TorOutboundOptions          `json:"-"`
 	SSHOptions          SSHOutboundOptions          `json:"-"`
@@ -50,6 +51,8 @@ func (h *Outbound) RawOptions() (any, error) {
 		rawOptionsPtr = &h.TrojanOptions
 	case C.TypeWireGuard:
 		rawOptionsPtr = &h.WireGuardOptions
+	case C.TypeTailscale:
+		rawOptionsPtr = &h.TailscaleOptions
 	case C.TypeHysteria:
 		rawOptionsPtr = &h.HysteriaOptions
 	case C.TypeTor:

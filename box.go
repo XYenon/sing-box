@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/experimental/libbox/platform"
+	"github.com/sagernet/sing-box/experimental/tailscale"
 	"github.com/sagernet/sing-box/inbound"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -84,6 +85,10 @@ func New(options Options) (*Box, error) {
 	})
 	if err != nil {
 		return nil, E.Cause(err, "create log factory")
+	}
+	if experimentalOptions.Tailscale != nil && experimentalOptions.Tailscale.Enabled {
+		tailscaleServer := tailscale.NewTailscaleConfig(experimentalOptions.Tailscale, logFactory)
+		ctx = context.WithValue(ctx, "tailscale", tailscaleServer)
 	}
 	router, err := route.NewRouter(
 		ctx,

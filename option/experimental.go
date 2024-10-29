@@ -1,9 +1,12 @@
 package option
 
+import "tailscale.com/types/opt"
+
 type ExperimentalOptions struct {
 	CacheFile *CacheFileOptions `json:"cache_file,omitempty"`
 	ClashAPI  *ClashAPIOptions  `json:"clash_api,omitempty"`
 	V2RayAPI  *V2RayAPIOptions  `json:"v2ray_api,omitempty"`
+	Tailscale *TailscaleOptions `json:"tailscale,omitempty"`
 	Debug     *DebugOptions     `json:"debug,omitempty"`
 }
 
@@ -49,4 +52,21 @@ type V2RayStatsServiceOptions struct {
 	Inbounds  []string `json:"inbounds,omitempty"`
 	Outbounds []string `json:"outbounds,omitempty"`
 	Users     []string `json:"users,omitempty"`
+}
+
+type TailscaleOptions struct {
+	Enabled    bool                            `json:"enabled,omitempty"`
+	AuthKey    string                          `json:"auth_key,omitempty"`
+	ControlURL string                          `json:"control_url,omitempty"`
+	Ephemeral  bool                            `json:"ephemeral,omitempty"`
+	WebUI      bool                            `json:"web_ui,omitempty"`
+	Nodes      map[string]TailscaleNodeOptions `json:"nodes,omitempty"`
+}
+
+type TailscaleNodeOptions struct {
+	AuthKey    string   `json:"auth_key,omitempty"`
+	ControlURL string   `json:"control_url,omitempty"`
+	Ephemeral  opt.Bool `json:"ephemeral,omitempty"`
+	WebUI      opt.Bool `json:"web_ui,omitempty"`
+	Hostname   string   `json:"hostname,omitempty"`
 }

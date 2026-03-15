@@ -3,6 +3,8 @@ package group
 import (
 	"context"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,12 +19,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type warningCounterLogger struct {
+	warnCount atomic.Int32
+}
+
+func (l *warningCounterLogger) Trace(...any) {}
+
+func (l *warningCounterLogger) Debug(...any) {}
+
+func (l *warningCounterLogger) Info(...any) {}
+
+func (l *warningCounterLogger) Warn(...any) {
+	l.warnCount.Add(1)
+}
+
+func (l *warningCounterLogger) Error(...any) {}
+
+func (l *warningCounterLogger) Fatal(...any) {}
+
+func (l *warningCounterLogger) Panic(...any) {}
+
 type testOutbound struct {
 	outbound.Adapter
-	dialErr        error
-	listenErr      error
-	dialConn       net.Conn
-	listenPacket   net.PacketConn
+	dialErr      error
+	listenErr    error
+	dialConn     net.Conn
+	listenPacket net.PacketConn
 }
 
 func (t *testOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -63,9 +85,9 @@ func TestTrackFailure_Disabled(t *testing.T) {
 	ob := newTestOutbound("test-a")
 	g := newTestGroup([]adapter.Outbound{ob}, 0)
 
-	g.trackFailure(ob)
-	g.trackFailure(ob)
-	g.trackFailure(ob)
+	g.trackFailure(N.NetworkTCP, ob)
+	g.trackFailure(N.NetworkTCP, ob)
+	g.trackFailure(N.NetworkTCP, ob)
 
 	require.Equal(t, int32(0), g.consecutiveFailures.Load())
 }
@@ -73,11 +95,13 @@ func TestTrackFailure_Disabled(t *testing.T) {
 func TestTrackFailure_BelowLimit(t *testing.T) {
 	ob := newTestOutbound("test-a")
 	g := newTestGroup([]adapter.Outbound{ob}, 3)
+	g.selectedOutboundTCP = ob
+	g.selectedOutboundUDP = ob
 
-	g.trackFailure(ob)
+	g.trackFailure(N.NetworkTCP, ob)
 	require.Equal(t, int32(1), g.consecutiveFailures.Load())
 
-	g.trackFailure(ob)
+	g.trackFailure(N.NetworkTCP, ob)
 	require.Equal(t, int32(2), g.consecutiveFailures.Load())
 }
 
@@ -94,10 +118,10 @@ func TestTrackFailure_ReachesLimit(t *testing.T) {
 		Delay: 100,
 	})
 
-	g.trackFailure(obA)
-	g.trackFailure(obA)
+	g.trackFailure(N.NetworkTCP, obA)
+	g.trackFailure(N.NetworkTCP, obA)
 	// Third failure reaches limit=3, triggers performUpdateCheck and resets counter
-	g.trackFailure(obA)
+	g.trackFailure(N.NetworkTCP, obA)
 
 	require.Equal(t, int32(0), g.consecutiveFailures.Load())
 	// performUpdateCheck should have switched to obB
@@ -117,13 +141,63 @@ func TestTrackFailure_ReachesLimit_NoSwitch(t *testing.T) {
 		Delay: 100,
 	})
 
-	g.trackFailure(obA)
-	g.trackFailure(obA)
+	g.trackFailure(N.NetworkTCP, obA)
+	g.trackFailure(N.NetworkTCP, obA)
 
 	// Counter still resets to 0 after reaching limit
 	require.Equal(t, int32(0), g.consecutiveFailures.Load())
 	// Selection unchanged
 	require.Equal(t, obA, g.selectedOutboundTCP)
+}
+
+func TestTrackFailure_IgnoresStaleOutbound(t *testing.T) {
+	obA := newTestOutbound("test-a")
+	obB := newTestOutbound("test-b")
+	g := newTestGroup([]adapter.Outbound{obA, obB}, 3)
+
+	// TCP has already switched to obB; obA is only selected for UDP.
+	g.selectedOutboundTCP = obB
+	g.selectedOutboundUDP = obA
+
+	g.trackFailure(N.NetworkTCP, obA)
+
+	require.Equal(t, int32(0), g.consecutiveFailures.Load())
+}
+
+func TestTrackFailure_ConcurrentThresholdTriggersSingleSwitch(t *testing.T) {
+	obA := newTestOutbound("test-a")
+	obB := newTestOutbound("test-b")
+	g := newTestGroup([]adapter.Outbound{obA, obB}, 3)
+	warnLogger := &warningCounterLogger{}
+	g.logger = warnLogger
+
+	g.selectedOutboundTCP = obA
+	g.selectedOutboundUDP = obA
+	g.history.StoreURLTestHistory("test-a", &adapter.URLTestHistory{
+		Time:  time.Now(),
+		Delay: 100,
+	})
+	g.history.StoreURLTestHistory("test-b", &adapter.URLTestHistory{
+		Time:  time.Now(),
+		Delay: 10,
+	})
+
+	// Set one less than limit so all concurrent failures race on the same threshold.
+	g.consecutiveFailures.Store(2)
+
+	const workers = 32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			g.trackFailure(N.NetworkTCP, obA)
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int32(1), warnLogger.warnCount.Load())
+	require.Equal(t, obB, g.selectedOutboundTCP)
 }
 
 func TestPerformUpdateCheck_ResetsCounterOnSwitch(t *testing.T) {

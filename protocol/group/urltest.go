@@ -99,10 +99,11 @@ func (s *URLTest) Close() error {
 }
 
 func (s *URLTest) Now() string {
-	if s.group.selectedOutboundTCP != nil {
-		return s.group.selectedOutboundTCP.Tag()
-	} else if s.group.selectedOutboundUDP != nil {
-		return s.group.selectedOutboundUDP.Tag()
+	selectedTCP, selectedUDP := s.group.selectedOutbounds()
+	if selectedTCP != nil {
+		return selectedTCP.Tag()
+	} else if selectedUDP != nil {
+		return selectedUDP.Tag()
 	}
 	return ""
 }
@@ -122,16 +123,17 @@ func (s *URLTest) CheckOutbounds() {
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
 	var outbound adapter.Outbound
-	switch N.NetworkName(network) {
+	networkName := N.NetworkName(network)
+	switch networkName {
 	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP
+		outbound = s.group.selectedOutbound(N.NetworkTCP)
 	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP
+		outbound = s.group.selectedOutbound(N.NetworkUDP)
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	if outbound == nil {
-		outbound, _ = s.group.Select(network)
+		outbound, _ = s.group.Select(string(networkName))
 	}
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
@@ -143,13 +145,13 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	}
 	s.logger.ErrorContext(ctx, err)
 	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	s.group.trackFailure(outbound)
+	s.group.trackFailure(string(networkName), outbound)
 	return nil, err
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP
+	outbound := s.group.selectedOutbound(N.NetworkUDP)
 	if outbound == nil {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
@@ -163,7 +165,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	}
 	s.logger.ErrorContext(ctx, err)
 	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	s.group.trackFailure(outbound)
+	s.group.trackFailure(N.NetworkUDP, outbound)
 	return nil, err
 }
 
@@ -179,7 +181,7 @@ func (s *URLTest) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 
 func (s *URLTest) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
 	s.group.Touch()
-	selected := s.group.selectedOutboundTCP
+	selected := s.group.selectedOutbound(N.NetworkTCP)
 	if selected == nil {
 		selected, _ = s.group.Select(N.NetworkTCP)
 	}
@@ -212,7 +214,8 @@ type URLTestGroup struct {
 	interruptExternalConnections bool
 	consecutiveFailureLimit      uint32
 	consecutiveFailures          atomic.Int32
-	access                       sync.Mutex
+	failureSwitching             atomic.Bool
+	access                       sync.RWMutex
 	ticker                       *time.Ticker
 	close                        chan struct{}
 	started                      bool
@@ -293,23 +296,37 @@ func (g *URLTestGroup) Close() error {
 	return nil
 }
 
-func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
-	var minDelay uint16
-	var minOutbound adapter.Outbound
+func (g *URLTestGroup) selectedOutbounds() (adapter.Outbound, adapter.Outbound) {
+	g.access.RLock()
+	defer g.access.RUnlock()
+	return g.selectedOutboundTCP, g.selectedOutboundUDP
+}
+
+func (g *URLTestGroup) selectedOutbound(network string) adapter.Outbound {
+	g.access.RLock()
+	defer g.access.RUnlock()
 	switch network {
 	case N.NetworkTCP:
-		if g.selectedOutboundTCP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP)); history != nil {
-				minOutbound = g.selectedOutboundTCP
-				minDelay = history.Delay
-			}
-		}
+		return g.selectedOutboundTCP
 	case N.NetworkUDP:
-		if g.selectedOutboundUDP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP)); history != nil {
-				minOutbound = g.selectedOutboundUDP
-				minDelay = history.Delay
-			}
+		return g.selectedOutboundUDP
+	default:
+		return nil
+	}
+}
+
+func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	selected := g.selectedOutbound(network)
+	return g.selectOutbound(network, selected)
+}
+
+func (g *URLTestGroup) selectOutbound(network string, selected adapter.Outbound) (adapter.Outbound, bool) {
+	var minDelay uint16
+	var minOutbound adapter.Outbound
+	if selected != nil {
+		if history := g.history.LoadURLTestHistory(RealTag(selected)); history != nil {
+			minOutbound = selected
+			minDelay = history.Delay
 		}
 	}
 	for _, detour := range g.outbounds {
@@ -418,27 +435,39 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	return result, nil
 }
 
-func (g *URLTestGroup) trackFailure(outbound adapter.Outbound) {
+func (g *URLTestGroup) trackFailure(network string, outbound adapter.Outbound) {
 	if g.consecutiveFailureLimit == 0 {
 		return
 	}
-	count := g.consecutiveFailures.Add(1)
-	if uint32(count) >= g.consecutiveFailureLimit {
-		g.consecutiveFailures.Store(0)
-		g.logger.Warn("outbound ", outbound.Tag(), " has ", count, " consecutive failures, switching to next best outbound")
-		g.performUpdateCheck()
+	if outbound == nil || g.selectedOutbound(network) != outbound {
+		return
 	}
+	count := g.consecutiveFailures.Add(1)
+	if uint32(count) < g.consecutiveFailureLimit {
+		return
+	}
+	if !g.failureSwitching.CompareAndSwap(false, true) {
+		return
+	}
+	defer g.failureSwitching.Store(false)
+	defer g.consecutiveFailures.Store(0)
+	if g.selectedOutbound(network) != outbound {
+		return
+	}
+	g.logger.Warn("outbound ", outbound.Tag(), " has ", count, " consecutive failures, switching to next best outbound")
+	g.performUpdateCheck()
 }
 
 func (g *URLTestGroup) performUpdateCheck() {
 	var updated bool
-	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil && (g.selectedOutboundTCP == nil || (exists && outbound != g.selectedOutboundTCP)) {
+	g.access.Lock()
+	if outbound, exists := g.selectOutbound(N.NetworkTCP, g.selectedOutboundTCP); outbound != nil && (g.selectedOutboundTCP == nil || (exists && outbound != g.selectedOutboundTCP)) {
 		if g.selectedOutboundTCP != nil {
 			updated = true
 		}
 		g.selectedOutboundTCP = outbound
 	}
-	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil && (g.selectedOutboundUDP == nil || (exists && outbound != g.selectedOutboundUDP)) {
+	if outbound, exists := g.selectOutbound(N.NetworkUDP, g.selectedOutboundUDP); outbound != nil && (g.selectedOutboundUDP == nil || (exists && outbound != g.selectedOutboundUDP)) {
 		if g.selectedOutboundUDP != nil {
 			updated = true
 		}
@@ -446,6 +475,9 @@ func (g *URLTestGroup) performUpdateCheck() {
 	}
 	if updated {
 		g.consecutiveFailures.Store(0)
+	}
+	g.access.Unlock()
+	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}
 }

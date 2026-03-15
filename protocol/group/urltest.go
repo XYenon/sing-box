@@ -125,15 +125,13 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	var outbound adapter.Outbound
 	networkName := N.NetworkName(network)
 	switch networkName {
-	case N.NetworkTCP:
-		outbound = s.group.selectedOutbound(N.NetworkTCP)
-	case N.NetworkUDP:
-		outbound = s.group.selectedOutbound(N.NetworkUDP)
+	case N.NetworkTCP, N.NetworkUDP:
+		outbound = s.group.selectedOutbound(networkName)
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	if outbound == nil {
-		outbound, _ = s.group.Select(string(networkName))
+		outbound, _ = s.group.Select(network)
 	}
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
@@ -145,7 +143,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	}
 	s.logger.ErrorContext(ctx, err)
 	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	s.group.trackFailure(string(networkName), outbound)
+	s.group.trackFailure(network, outbound)
 	return nil, err
 }
 
